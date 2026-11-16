@@ -33,6 +33,7 @@ if (missingEnv.length) {
   process.exit(1);
 }
 
+
 // ==================================================
 // CORS
 // ==================================================
@@ -42,7 +43,13 @@ const allowedOrigins = [
   "http://localhost:3001",
   "http://localhost:3002",
   "http://localhost:5173",
+
+  // Admin panel
   "https://bgmi-admin-panel-9eei.onrender.com",
+
+  // Cloudflare BGMI frontend
+  "https://bgmi-esports.aradhyasingh-73728.workers.dev",
+
   ...(process.env.EXTRA_ALLOWED_ORIGINS || "")
     .split(",")
     .map((origin) => origin.trim().replace(/\/$/, ""))
@@ -56,15 +63,21 @@ app.use(
         return callback(null, true);
       }
 
+      console.error("Blocked CORS origin:", origin);
+
       const error = new Error("Origin not allowed by CORS.");
       error.statusCode = 403;
       return callback(error);
     },
+
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
     allowedHeaders: ["Content-Type", "Authorization"],
+
     optionsSuccessStatus: 204,
   })
 );
+
 
 // ==================================================
 // SUPABASE
