@@ -38,6 +38,7 @@ if (missingEnv.length) {
 // CORS
 // ==================================================
 
+
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:3001",
@@ -47,6 +48,9 @@ const allowedOrigins = [
   // Admin panel
   "https://bgmi-admin-panel-9eei.onrender.com",
 
+  // Cloudflare BGMI Admin Panel
+  "https://bgmi-admin-panel.aradhyasingh-73728.workers.dev",
+
   // Cloudflare BGMI frontend
   "https://bgmi-esports.aradhyasingh-73728.workers.dev",
 
@@ -55,6 +59,7 @@ const allowedOrigins = [
     .map((origin) => origin.trim().replace(/\/$/, ""))
     .filter(Boolean),
 ];
+
 
 app.use(
   cors({
