@@ -44,6 +44,7 @@ const allowedOrigins = [
   "http://localhost:3001",
   "http://localhost:3002",
   "http://localhost:5173",
+  "http://10.156.248.201:3001",
 
   // Admin panel
   "https://bgmi-admin-panel-9eei.onrender.com",
@@ -144,7 +145,12 @@ function requireAdmin(req, res, next) {
 
     req.admin = decoded;
     next();
-  } catch {
+    } catch (error) {
+    console.error("ADMIN JWT VERIFICATION FAILED:", {
+      name: error.name,
+      message: error.message,
+    });
+
     return res.status(401).json({
       success: false,
       error: "Invalid or expired admin token.",
