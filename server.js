@@ -52,8 +52,13 @@ const allowedOrigins = [
   // Cloudflare BGMI Admin Panel
   "https://bgmi-admin-panel.aradhyasingh-73728.workers.dev",
 
+
+ 
   // Cloudflare BGMI frontend
-  "https://bgmi-esports.aradhyasingh-73728.workers.dev",
+"https://bgmi-esports.aradhyasingh-73728.workers.dev",
+
+// New BGMI tournament frontend
+"https://bgmi.tournament-esports.workers.dev",
 
   ...(process.env.EXTRA_ALLOWED_ORIGINS || "")
     .split(",")
