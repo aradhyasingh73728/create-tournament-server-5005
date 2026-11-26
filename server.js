@@ -12,6 +12,20 @@ const PORT = Number(process.env.PORT) || 5005;
 
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
+
+// Response compression (speed). Package install na ho to server
+// normal chalta rahega, sirf compression band rahega.
+// Install: npm i compression
+try {
+  const { default: compression } = await import("compression");
+
+  app.use(compression());
+
+  console.log("Response compression active");
+} catch {
+  console.log("'compression' package not installed (npm i compression)");
+}
+
 app.use(express.json({ limit: "1mb" }));
 
 // ==================================================
@@ -112,6 +126,59 @@ const RESULT_TABLE = "tournament_results";
 const asyncHandler = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
 };
+
+// ==================================================
+// SHORT PUBLIC CACHE
+// Public lists ko har request par DB se nahi banate.
+// Ek hi time par aayi bahut si requests ek hi query share karti hain.
+// Admin koi bhi badlav kare to cache turant saaf ho jata hai.
+// ==================================================
+
+const PUBLIC_CACHE_MS = 5000;
+const HISTORY_CACHE_MS = 10000;
+
+const publicCache = new Map(); // key -> { promise, expiresAt }
+
+function cachedResponse(key, ttlMs, producer) {
+  const now = Date.now();
+  const hit = publicCache.get(key);
+
+  if (hit && hit.expiresAt > now) {
+    return hit.promise;
+  }
+
+  const promise = producer().catch((error) => {
+    publicCache.delete(key);
+    throw error;
+  });
+
+  publicCache.set(key, {
+    promise,
+    expiresAt: now + ttlMs,
+  });
+
+  return promise;
+}
+
+const clearPublicCache = () => publicCache.clear();
+
+// Admin ka koi bhi POST/PUT/PATCH/DELETE ke baad public cache saaf
+app.use("/api/admin", (req, res, next) => {
+  if (req.method !== "GET") {
+    res.on("finish", clearPublicCache);
+  }
+
+  next();
+});
+
+function throwDatabaseError(error, message = "Database operation failed.") {
+  console.error(message, error);
+
+  const wrapped = new Error(message);
+  wrapped.statusCode = 500;
+
+  throw wrapped;
+}
 
 // ==================================================
 // ADMIN AUTHENTICATION
@@ -300,6 +367,15 @@ function getTournamentMatchKey(tournament) {
     tournament.date,
     tournament.time
   );
+}
+
+// List banate waqt ek kharab row poori list na tod de
+function safeMatchKey(tournament) {
+  try {
+    return getTournamentMatchKey(tournament);
+  } catch {
+    return null;
+  }
 }
 
 function numberValue(value, field, minimum = 0, integer = false) {
@@ -585,31 +661,176 @@ async function getTournamentResults(tournamentId, matchKey) {
   return data || [];
 }
 
+// --------------------------------------------------
+// BATCH HELPERS (ek-ek tournament ke liye alag query nahi)
+// --------------------------------------------------
+
+const BATCH_CHUNK = 100;
+
+function chunkArray(items, size = BATCH_CHUNK) {
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+// Supabase ek query me max ~1000 rows deta hai, isliye pages me padho
+async function fetchAllPages(buildQuery, pageSize = 1000) {
+  const all = [];
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await buildQuery().range(
+      from,
+      from + pageSize - 1
+    );
+
+    if (error) throw error;
+
+    all.push(...(data || []));
+
+    if (!data || data.length < pageSize) break;
+  }
+
+  return all;
+}
+
+async function fetchJoinsForKeys(keys, columns) {
+  if (!keys.length) return [];
+
+  const parts = await Promise.all(
+    chunkArray(keys).map((keyChunk) =>
+      fetchAllPages(() =>
+        supabase
+          .from(JOIN_TABLE)
+          .select(columns)
+          .in("match_key", keyChunk)
+          .order("id", { ascending: true })
+      )
+    )
+  );
+
+  return parts.flat();
+}
+
+async function fetchResultsForKeys(keys, columns) {
+  if (!keys.length) return [];
+
+  const parts = await Promise.all(
+    chunkArray(keys).map((keyChunk) =>
+      fetchAllPages(() =>
+        supabase
+          .from(RESULT_TABLE)
+          .select(columns)
+          .in("match_key", keyChunk)
+          .order("id", { ascending: true })
+      )
+    )
+  );
+
+  return parts.flat();
+}
+
+async function getTournamentsByIds(tournamentIds) {
+  const map = new Map();
+
+  if (!tournamentIds.length) return map;
+
+  const parts = await Promise.all(
+    chunkArray(tournamentIds).map(async (idChunk) => {
+      const { data, error } = await supabase
+        .from(TABLE)
+        .select("*")
+        .in("tournament_id", idChunk);
+
+      if (error) throw error;
+
+      return data || [];
+    })
+  );
+
+  parts.flat().forEach((tournament) => {
+    map.set(tournament.tournament_id, tournament);
+  });
+
+  return map;
+}
+
+let countsRpcWarned = false;
+
+// Saare match_keys ke joined counts ek hi query me.
+// SQL function tournament_match_counts use hota hai; na ho to
+// fallback me sirf match_key column padh ke count karta hai.
+async function getJoinedCountsMap(keys) {
+  const counts = new Map();
+
+  if (!keys.length) return counts;
+
+  const { data, error } = await supabase.rpc(
+    "tournament_match_counts",
+    { p_keys: keys }
+  );
+
+  if (!error && Array.isArray(data)) {
+    data.forEach((row) => {
+      counts.set(row.match_key, Number(row.total || 0));
+    });
+
+    return counts;
+  }
+
+  if (!countsRpcWarned) {
+    countsRpcWarned = true;
+
+    console.warn(
+      "tournament_match_counts RPC unavailable, using fallback count:",
+      error?.message
+    );
+  }
+
+  const rows = await fetchJoinsForKeys(keys, "match_key");
+
+  rows.forEach((row) => {
+    counts.set(row.match_key, (counts.get(row.match_key) || 0) + 1);
+  });
+
+  return counts;
+}
+
 async function attachCounts(rows, includePlayers = false) {
-  return Promise.all(
-    rows.map(async (row) => {
-      const matchKey = getTournamentMatchKey(row);
+  const keyed = rows.map((row) => ({
+    row,
+    key: safeMatchKey(row),
+  }));
 
-      const count = await getJoinedCount(
-        row.tournament_id,
-        matchKey
-      );
+  const keys = [
+    ...new Set(keyed.map((item) => item.key).filter(Boolean)),
+  ];
 
-      const tournament = toClientTournament(row, count);
+  // Admin API ke liye joined players ki details (ek hi query me sabki)
+  if (includePlayers) {
+    const joins = await fetchJoinsForKeys(
+      keys,
+      "id, tournament_id, match_key, player_name, bgmi_id, profile_id"
+    );
 
-      // Public API mein player details nahi bhejni.
-      if (!includePlayers) {
-        return tournament;
+    const joinsByKey = new Map();
+
+    joins.forEach((join) => {
+      if (!joinsByKey.has(join.match_key)) {
+        joinsByKey.set(join.match_key, []);
       }
 
-      // Admin API ke liye joined players ki details.
-      const players = await getTournamentPlayers(
-        row.tournament_id,
-        matchKey
-      );
+      joinsByKey.get(join.match_key).push(join);
+    });
+
+    return keyed.map(({ row, key }) => {
+      const players = (key && joinsByKey.get(key)) || [];
 
       return {
-        ...tournament,
+        ...toClientTournament(row, players.length),
 
         joinedPlayersList: players.map((player) => ({
           join_id: player.id,
@@ -618,7 +839,14 @@ async function attachCounts(rows, includePlayers = false) {
           profile_id: player.profile_id || "",
         })),
       };
-    })
+    });
+  }
+
+  // Public API: player details nahi bhejni, sirf count
+  const counts = await getJoinedCountsMap(keys);
+
+  return keyed.map(({ row, key }) =>
+    toClientTournament(row, key ? counts.get(key) || 0 : 0)
   );
 }
 
@@ -686,6 +914,20 @@ function sortLeaderboard(players) {
   });
 }
 
+function groupBy(items, keyFn) {
+  const map = new Map();
+
+  items.forEach((item) => {
+    const key = keyFn(item);
+
+    if (!map.has(key)) map.set(key, []);
+
+    map.get(key).push(item);
+  });
+
+  return map;
+}
+
 // ==================================================
 // HEALTH
 // ==================================================
@@ -720,12 +962,15 @@ app.get(
 
 // ==================================================
 // ADMIN: GET ALL TOURNAMENTS
+// ?players=0  => joinedPlayersList nahi bhejta (bahut tez + chhota response)
 // ==================================================
 
 app.get(
   "/api/admin/tournaments",
   requireAdmin,
   asyncHandler(async (req, res) => {
+    const includePlayers = req.query.players !== "0";
+
     const { data, error } = await supabase
       .from(TABLE)
       .select("*")
@@ -737,7 +982,7 @@ app.get(
 
     res.json({
       success: true,
-      tournaments: await attachCounts(data || [], true),
+      tournaments: await attachCounts(data || [], includePlayers),
     });
   })
 );
@@ -1518,7 +1763,9 @@ app.delete(
       message: "Tournament deleted and player entry fees refunded successfully.",
       result: {
         ...result,
+        // SQL function 'players_refunded' bhejta hai
         refunded_players: Number(
+          result.players_refunded ??
           result.refunded_players ??
           result.refunds_count ??
           result.refund_count ??
@@ -2124,30 +2371,35 @@ app.get(
       return sendDatabaseError(res, joinError);
     }
 
-    const matches = [];
+    const joinList = joins || [];
 
-    for (const join of joins || []) {
-      const tournament = await getTournament(
-        join.tournament_id
+    // Sabhi tournaments ek hi query me
+    const tournamentMap = await getTournamentsByIds([
+      ...new Set(joinList.map((join) => join.tournament_id)),
+    ]);
+
+    const liveJoins = joinList.filter((join) => {
+      const tournament = tournamentMap.get(join.tournament_id);
+
+      return (
+        tournament &&
+        tournament.tournament_status === "Live" &&
+        join.match_key &&
+        join.match_key === safeMatchKey(tournament)
       );
+    });
 
-      if (!tournament) continue;
+    // Sabhi counts ek hi query me
+    const counts = await getJoinedCountsMap([
+      ...new Set(liveJoins.map((join) => join.match_key)),
+    ]);
 
-      if (tournament.tournament_status !== "Live") {
-        continue;
-      }
+    const matches = liveJoins.map((join) => {
+      const tournament = tournamentMap.get(join.tournament_id);
 
-      const matchKey = join.match_key;
-
-      if (!matchKey) continue;
-
-      if (matchKey !== getTournamentMatchKey(tournament)) {
-        continue;
-      }
-
-      matches.push({
+      return {
         id: join.id,
-        match_key: matchKey,
+        match_key: join.match_key,
 
         tournament_id: tournament.tournament_id,
         name: tournament.tournament_name,
@@ -2164,18 +2416,15 @@ app.get(
         entry_fee: Number(tournament.entry_fee || 0),
         prize_pool: Number(tournament.prize_pool || 0),
 
-        joined_players: await getJoinedCount(
-          tournament.tournament_id,
-          matchKey
-        ),
+        joined_players: counts.get(join.match_key) || 0,
 
         total_slots: Number(tournament.slots || 50),
         slots: Number(tournament.slots || 50),
 
         room_id: join.room_id || "",
         room_password: join.room_password || "",
-      });
-    }
+      };
+    });
 
     res.json({
       success: true,
@@ -2211,30 +2460,48 @@ app.get(
       return sendDatabaseError(res, joinError);
     }
 
-    const matches = [];
+    const joinList = joins || [];
 
-    for (const join of joins || []) {
-      const tournament = await getTournament(
-        join.tournament_id
+    // Sabhi tournaments ek hi query me
+    const tournamentMap = await getTournamentsByIds([
+      ...new Set(joinList.map((join) => join.tournament_id)),
+    ]);
+
+    const completedJoins = joinList.filter((join) => {
+      const tournament = tournamentMap.get(join.tournament_id);
+
+      return (
+        tournament &&
+        tournament.tournament_status === "Completed" &&
+        join.match_key
       );
+    });
 
-      if (!tournament) continue;
+    const keys = [
+      ...new Set(completedJoins.map((join) => join.match_key)),
+    ];
 
-      if (tournament.tournament_status !== "Completed") {
-        continue;
-      }
+    // Sabhi players aur results ek-ek batch query me
+    const [allPlayers, allResults] = await Promise.all([
+      fetchJoinsForKeys(
+        keys,
+        "id, tournament_id, match_key, player_name, bgmi_id, profile_name, profile_id"
+      ),
+      fetchResultsForKeys(
+        keys,
+        "join_id, match_key, kills, rank_position, points, is_winner, winner_prize, per_kill, kill_amount, total_winning, status, paid_at"
+      ),
+    ]);
 
-      const matchKey = join.match_key;
+    const playersByKey = groupBy(allPlayers, (player) => player.match_key);
+    const resultsByKey = groupBy(allResults, (result) => result.match_key);
 
-      if (!matchKey) continue;
-
-      const [players, results] = await Promise.all([
-        getTournamentPlayers(tournament.tournament_id, matchKey),
-        getTournamentResults(tournament.tournament_id, matchKey),
-      ]);
+    const matches = completedJoins.map((join) => {
+      const tournament = tournamentMap.get(join.tournament_id);
+      const players = playersByKey.get(join.match_key) || [];
 
       const resultMap = new Map(
-        results.map((result) => [
+        (resultsByKey.get(join.match_key) || []).map((result) => [
           String(result.join_id),
           result,
         ])
@@ -2249,9 +2516,9 @@ app.get(
         )
       );
 
-      matches.push({
+      return {
         id: join.id,
-        match_key: matchKey,
+        match_key: join.match_key,
 
         tournament_id: tournament.tournament_id,
         name: tournament.tournament_name,
@@ -2269,8 +2536,8 @@ app.get(
 
         total_players: players.length,
         results: leaderboard,
-      });
-    }
+      };
+    });
 
     matches.sort((a, b) => {
       const dateA = new Date(`${a.date}T${a.time}`);
@@ -2294,28 +2561,32 @@ app.get(
 app.get(
   "/api/tournaments",
   asyncHandler(async (req, res) => {
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select(
-        "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,rules,image_url,published,is_hidden,tournament_status,created_at,updated_at"
-      )
-      
-.eq("published", true)
-.eq("is_hidden", false)
-.eq("tournament_status", "Upcoming")
-.gte("date", getIndiaDate())
-.order("date", { ascending: true })
-.order("time", { ascending: true });
+    const payload = await cachedResponse(
+      "public-upcoming",
+      PUBLIC_CACHE_MS,
+      async () => {
+        const { data, error } = await supabase
+          .from(TABLE)
+          .select(
+            "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,rules,image_url,published,is_hidden,tournament_status,created_at,updated_at"
+          )
+          .eq("published", true)
+          .eq("is_hidden", false)
+          .eq("tournament_status", "Upcoming")
+          .gte("date", getIndiaDate())
+          .order("date", { ascending: true })
+          .order("time", { ascending: true });
 
+        if (error) throwDatabaseError(error);
 
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+        return {
+          success: true,
+          tournaments: await attachCounts(data || []),
+        };
+      }
+    );
 
-    res.json({
-      success: true,
-      tournaments: await attachCounts(data || []),
-    });
+    res.json(payload);
   })
 );
 
@@ -2326,24 +2597,30 @@ app.get(
 app.get(
   "/api/live-tournaments",
   asyncHandler(async (req, res) => {
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select(
-        "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,rules,image_url,published,is_hidden,tournament_status,created_at,updated_at"
-      )
-      .eq("tournament_status", "Live")
-      .eq("is_hidden", false)
-      .order("date", { ascending: true })
-      .order("time", { ascending: true });
+    const payload = await cachedResponse(
+      "public-live",
+      PUBLIC_CACHE_MS,
+      async () => {
+        const { data, error } = await supabase
+          .from(TABLE)
+          .select(
+            "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,rules,image_url,published,is_hidden,tournament_status,created_at,updated_at"
+          )
+          .eq("tournament_status", "Live")
+          .eq("is_hidden", false)
+          .order("date", { ascending: true })
+          .order("time", { ascending: true });
 
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+        if (error) throwDatabaseError(error);
 
-    res.json({
-      success: true,
-      tournaments: await attachCounts(data || []),
-    });
+        return {
+          success: true,
+          tournaments: await attachCounts(data || []),
+        };
+      }
+    );
+
+    res.json(payload);
   })
 );
 
@@ -2354,57 +2631,87 @@ app.get(
 app.get(
   "/api/tournament-history",
   asyncHandler(async (req, res) => {
-    const { data: tournaments, error } = await supabase
-      .from(TABLE)
-      .select(
-        "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,published,is_hidden,tournament_status,created_at,updated_at"
-      )
-      .eq("tournament_status", "Completed")
-      .eq("is_hidden", false)
-      .order("date", { ascending: false })
-      .order("time", { ascending: false });
+    const payload = await cachedResponse(
+      "public-history",
+      HISTORY_CACHE_MS,
+      async () => {
+        const { data: tournaments, error } = await supabase
+          .from(TABLE)
+          .select(
+            "tournament_id,tournament_name,game_mode,match_type,map,date,time,entry_fee,prize_pool,per_kill,slots,published,is_hidden,tournament_status,created_at,updated_at"
+          )
+          .eq("tournament_status", "Completed")
+          .eq("is_hidden", false)
+          .order("date", { ascending: false })
+          .order("time", { ascending: false });
 
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+        if (error) throwDatabaseError(error);
 
-    const history = await Promise.all(
-      (tournaments || []).map(async (tournament) => {
-        const matchKey = getTournamentMatchKey(tournament);
+        const keyed = (tournaments || []).map((tournament) => ({
+          tournament,
+          key: safeMatchKey(tournament),
+        }));
 
-        const [players, results] = await Promise.all([
-          getTournamentPlayers(tournament.tournament_id, matchKey),
-          getTournamentResults(tournament.tournament_id, matchKey),
+        const keys = [
+          ...new Set(keyed.map((item) => item.key).filter(Boolean)),
+        ];
+
+        // Saare tournaments ke players aur results ek-ek batch query me
+        const [allPlayers, allResults] = await Promise.all([
+          fetchJoinsForKeys(
+            keys,
+            "id, tournament_id, match_key, player_name, bgmi_id, profile_name, profile_id"
+          ),
+          fetchResultsForKeys(
+            keys,
+            "join_id, match_key, kills, rank_position, points, is_winner, winner_prize, per_kill, kill_amount, total_winning, status, paid_at"
+          ),
         ]);
 
-        const resultMap = new Map(
-          results.map((result) => [
-            String(result.join_id),
-            result,
-          ])
+        const playersByKey = groupBy(
+          allPlayers,
+          (player) => player.match_key
         );
 
-        const leaderboard = sortLeaderboard(
-          players.map((player) =>
-            makePlayerResult(
-              player,
-              resultMap.get(String(player.id)) || null
-            )
-          )
+        const resultsByKey = groupBy(
+          allResults,
+          (result) => result.match_key
         );
+
+        const history = keyed.map(({ tournament, key }) => {
+          const players = (key && playersByKey.get(key)) || [];
+
+          const resultMap = new Map(
+            ((key && resultsByKey.get(key)) || []).map((result) => [
+              String(result.join_id),
+              result,
+            ])
+          );
+
+          const leaderboard = sortLeaderboard(
+            players.map((player) =>
+              makePlayerResult(
+                player,
+                resultMap.get(String(player.id)) || null
+              )
+            )
+          );
+
+          return {
+            ...toClientTournament(tournament, players.length),
+            match_key: key,
+            players: leaderboard,
+          };
+        });
 
         return {
-          ...toClientTournament(tournament, players.length),
-          match_key: matchKey,
-          players: leaderboard,
+          success: true,
+          history,
         };
-      })
+      }
     );
 
-    res.json({
-      success: true,
-      history,
-    });
+    res.json(payload);
   })
 );
 
@@ -2525,13 +2832,7 @@ app.use((err, req, res, next) => {
 // ==================================================
 
 async function processDailyTournaments() {
-
-  console.log("=====================================");
-  console.log("DAILY SCHEDULER CHECK STARTED");
-
   const today = getIndiaDate();
-
-  console.log("Today India Date:", today);
 
   const { data: rules, error } = await supabase
     .from("daily_tournament_rules")
@@ -2547,10 +2848,13 @@ async function processDailyTournaments() {
     );
     return;
   }
-  console.log("Active Due Rules:", rules);
-  console.log("Due Rules Count:", rules?.length || 0);
 
-  for (const rule of rules || []) {
+  // Koi rule due nahi hai to chupchap wapas (har minute log nahi)
+  if (!rules || rules.length === 0) return;
+
+  console.log("DAILY SCHEDULER: due rules:", rules.length, "date:", today);
+
+  for (const rule of rules) {
     try {
       // Use next_run_date so missed dates are also generated.
       const { data, error } = await supabase.rpc(
@@ -2583,6 +2887,9 @@ async function processDailyTournaments() {
       );
     }
   }
+
+  // Naye tournaments bane hain, public lists fresh dikhni chahiye
+  clearPublicCache();
 }
 
 // Every minute check whether a daily tournament is due.
